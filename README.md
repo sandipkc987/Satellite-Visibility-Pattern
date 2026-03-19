@@ -114,7 +114,7 @@ The `floor()` function is used because orbit number must be a whole number.
 
 ## Handover Strategies
 
-### Strategy 1 — Highest Elevation Angle (File-6)
+### Strategy 1 — Highest Elevation Angle 
 The satellite with the highest elevation angle is selected as the serving 
 satellite. At lower elevation angles the signal travels a longer atmospheric 
 path — at 10 degrees elevation the path is approximately **5.76× longer** 
@@ -132,7 +132,7 @@ If either condition is not met, the terminal stays on the current satellite
 regardless of whether a higher elevation is available. **Forced handovers** 
 occur only when the serving satellite drops below the 10-degree minimum mask.
 
-### Strategy 2 — Longest Visual Time (File-7)
+### Strategy 2 — Longest Visual Time
 Selects the satellite with the most remaining visibility time above the ground 
 station. The terminal stays connected until the satellite drops below the 
 horizon — **forced handovers only, no voluntary switching.**
