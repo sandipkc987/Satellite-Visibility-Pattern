@@ -1,0 +1,866 @@
+%% LONGEST VISUAL TIME HANDOVER TABLE
+% ========================================================================
+% PURPOSE
+% ========================================================================
+% This script implements the Longest Visual Time handover strategy, one of
+% the key methods discussed in:
+%
+%   Romero et al., "Handover Management and Doppler Shift Compensation
+%   in Satellite Communications", University of North Texas.
+%
+% The idea behind this strategy is simple but effective: instead of always
+% chasing the satellite with the best signal right now, the terminal
+% connects to whichever satellite will stay visible for the longest time.
+% In practice this means fewer handovers, because you're not switching
+% away from a satellite until it actually disappears below the horizon —
+% there are no voluntary early handovers.
+
+%
+% Both files share the same constellation, ground station, access matrix,
+% output table structure, and Excel export approach. The only thing that
+% changes between them is the selection criterion in Section 8.
+%
+%
+% ========================================================================
+
+clc;
+clear;
+close all;
+
+%% ========================================================================
+% 1) LOAD FILE-1 WORKSPACE
+% ========================================================================
+% The constellation, TLE table, scenario timing, and sample rate were all
+% saved by File-1. Loading that workspace here avoids having to rebuild
+% everything from scratch.
+
+saveFolder  = 'C:\Users\sandy\Downloads\Starlink Visiblity Pattern';
+matFileName = fullfile(saveFolder, 'starlink_first_shell_workspace.mat');
+
+load(matFileName);
+
+fprintf('Workspace loaded successfully.\n');
+
+%% ========================================================================
+% 2) CREATE IRVING GROUND STATION
+% ========================================================================
+% Irving, Texas is the reference ground station for this study. The 10-degree
+% minimum elevation angle filters out satellites that are too close to the
+% horizon to provide a usable link.
+
+gsLat        = 32.8140;
+gsLon        = -96.9489;
+gsAlt        = 0;
+minElevation = 10;
+
+irvingGS = groundStation(sc, ...
+    "Name",              "Irving Texas", ...
+    "Latitude",          gsLat, ...
+    "Longitude",         gsLon, ...
+    "Altitude",          gsAlt, ...
+    "MinElevationAngle", minElevation);
+
+fprintf('Ground station created at Irving, Texas.\n');
+
+%% ========================================================================
+% 3) COMPUTE ACCESS STATUS FOR ALL SATELLITES
+% ========================================================================
+% Ask the satellite toolbox which satellites can see Irving at each time
+% step. The result is a binary matrix that we normalise to
+% [numTimeSteps x numSats] so the indexing stays consistent everywhere.
+
+acMain = access(walkerSats, irvingGS);
+[acStatsAllTime, timeHistory] = accessStatus(acMain);
+
+numSats      = numel(walkerSats);
+numTimeSteps = numel(timeHistory);
+
+fprintf('Access status computed.\n');
+fprintf('Satellites in constellation : %d\n', numSats);
+fprintf('Time steps in scenario      : %d\n', numTimeSteps);
+
+% The toolbox can return the matrix in either orientation depending on the
+% MATLAB version — normalise to [time x satellites] regardless.
+if size(acStatsAllTime,1) == numSats && size(acStatsAllTime,2) == numTimeSteps
+    statusByTime = acStatsAllTime.';
+elseif size(acStatsAllTime,1) == numTimeSteps && size(acStatsAllTime,2) == numSats
+    statusByTime = acStatsAllTime;
+else
+    error('Unexpected access-status matrix size.');
+end
+
+%% ========================================================================
+% 4) FIND THE HANDLER SATELLITE
+% ========================================================================
+% One satellite is flagged as the "handler" — a specific satellite of
+% interest for this research. We locate its row index here so we can
+% highlight it in the output tables.
+
+handlerIndex = find(tleTable.IsHandler == true, 1, 'first');
+
+if isempty(handlerIndex)
+    error('Handler satellite not found in tleTable.');
+end
+
+fprintf('Handler index : %d\n', handlerIndex);
+fprintf('Handler label : %s\n', tleTable.SatelliteLabel(handlerIndex));
+
+%% ========================================================================
+% 5) WORK OUT THE CORRECT ARGUMENT ORDER FOR aer()
+% ========================================================================
+% The aer() function changed its argument order between MATLAB releases.
+% We test it once here at startup and store the result so the main loop
+% can call it correctly without guessing at each step.
+
+aerOrderGSFirst = true;
+
+try
+    [~, ~, ~] = aer(irvingGS, walkerSats(1), timeHistory(1));
+    aerOrderGSFirst = true;
+    fprintf('aer() argument order: (groundStation, satellite, time)\n');
+catch
+    aerOrderGSFirst = false;
+    fprintf('aer() argument order: (satellite, groundStation, time)\n');
+end
+
+%% ========================================================================
+% 6) PRE-COMPUTE REMAINING VISIBILITY MATRIX
+% ========================================================================
+% This is the step that makes the longest-visual-time strategy efficient.
+%
+% remainingSteps(t, s) answers the question: "If satellite s is visible
+% right now at step t, how many more consecutive steps will it remain
+% visible?" We compute this for every satellite at every time step by
+% scanning backwards from the last time step to the first:
+%
+%   If the satellite is not visible at step t:  remainingSteps(t,s) = 0
+%   If it is visible at step t:                 remainingSteps(t,s) = 1
+%                                               + remainingSteps(t+1,s)
+%
+% The backward scan means each row depends only on the row below it,
+% so the whole matrix is filled in a single pass. Multiplying by the
+% sample interval then converts step counts to seconds of visibility.
+% This costs one O(numTimeSteps x numSats) pass before the loop, but
+% saves any inner scanning during the main selection loop.
+
+fprintf('\nPre-computing remaining visibility matrix...\n');
+tPrecomp = tic;
+
+remainingSteps = zeros(numTimeSteps, numSats);
+
+% Seed the last row — at the final time step, remaining equals visibility
+remainingSteps(numTimeSteps, :) = statusByTime(numTimeSteps, :);
+
+% Fill backwards, one row at a time
+for t = (numTimeSteps - 1) : -1 : 1
+    remainingSteps(t, :) = statusByTime(t, :) .* (1 + remainingSteps(t+1, :));
+end
+
+% Convert step counts to seconds
+remainingSec = remainingSteps * sampleTime;
+
+fprintf('Pre-computation complete in %.2f s\n', toc(tPrecomp));
+fprintf('remainingSec matrix size: %d x %d\n', size(remainingSec));
+
+%% ========================================================================
+% 7) PREPARE STORAGE ARRAYS
+% ========================================================================
+% All output arrays are pre-allocated to their final size here. This avoids
+% the performance penalty of growing arrays inside a loop, which in MATLAB
+% causes the entire array to be copied in memory on each append.
+
+bestSatIndex         = nan(numTimeSteps, 1);
+bestElevation_deg    = nan(numTimeSteps, 1);
+bestRemainingVis_sec = nan(numTimeSteps, 1);
+numVisibleSats       = zeros(numTimeSteps, 1);
+
+% Track which satellite is currently serving
+currentServingSat = NaN;
+
+tStart = tic;
+cumulativeSatelliteScans = 0;
+
+fprintf('\n============================================================\n');
+fprintf('Starting Longest Visual Time satellite selection...\n');
+fprintf('Rule: connect to the satellite with the most remaining visibility.\n');
+fprintf('Tiebreaker: highest elevation when two satellites tie on window length.\n');
+fprintf('============================================================\n');
+
+%% ========================================================================
+% 8) SELECT THE BEST SATELLITE AT EACH TIME STEP
+% ========================================================================
+% The selection logic here is deliberately simpler than File-6. There are
+% no voluntary early handovers and no hysteresis parameters to tune —
+% the terminal stays on its current satellite until that satellite drops
+% below the horizon, then switches to whichever available satellite has
+% the longest remaining window.
+%
+% When a forced handover is needed:
+%   1. Look up the pre-computed remaining visibility for all visible sats.
+%   2. Select the one with the highest remaining time.
+%   3. If two satellites are tied (they disappear at the same step),
+%      break the tie by choosing the one at higher elevation.
+%
+% This matches the strategy described in the Romero et al. paper, which
+% showed that minimising handover frequency outperforms maximising
+% instantaneous signal quality when handover delays exceed about 130 ms.
+
+for tIdx = 1:numTimeSteps
+
+    currentTime = timeHistory(tIdx);
+    visibleIdx  = find(statusByTime(tIdx, :));
+    numVisible  = numel(visibleIdx);
+    numVisibleSats(tIdx) = numVisible;
+
+    if numVisible == 0
+        % No satellite visible — record a gap and reset serving state
+        currentServingSat            = NaN;
+        bestSatIndex(tIdx)           = NaN;
+        bestElevation_deg(tIdx)      = NaN;
+        bestRemainingVis_sec(tIdx)   = 0;
+
+    else
+        cumulativeSatelliteScans = cumulativeSatelliteScans + numVisible;
+
+        % Read the pre-computed remaining visibility for each visible satellite
+        visRemaining = remainingSec(tIdx, visibleIdx);   % 1 x numVisible
+        maxRemaining = max(visRemaining);
+
+        % Is the current serving satellite still above the horizon?
+        currentStillVisible = ~isnan(currentServingSat) && ...
+                               ismember(currentServingSat, visibleIdx);
+
+        if currentStillVisible
+            % Stay on the current satellite — no voluntary early handover.
+            % Just record its current elevation and remaining visibility.
+            servingLocalIdx = find(visibleIdx == currentServingSat, 1);
+
+            if aerOrderGSFirst
+                [~, elevServing, ~] = aer(irvingGS, ...
+                    walkerSats(currentServingSat), currentTime);
+            else
+                [~, elevServing, ~] = aer(walkerSats(currentServingSat), ...
+                    irvingGS, currentTime);
+            end
+
+            bestSatIndex(tIdx)           = currentServingSat;
+            bestElevation_deg(tIdx)      = round(elevServing, 4);
+            bestRemainingVis_sec(tIdx)   = visRemaining(servingLocalIdx);
+
+        else
+            % The current satellite has gone below the horizon (or this is
+            % the very first step). Pick the best available replacement.
+
+            % Compute elevation for all visible satellites — needed for tiebreaking
+            if aerOrderGSFirst
+                [~, elevAll, ~] = aer(irvingGS, walkerSats(visibleIdx), currentTime);
+            else
+                [~, elevAll, ~] = aer(walkerSats(visibleIdx), irvingGS, currentTime);
+            end
+
+            % Find satellites tied at the maximum remaining visibility
+            tiedMask     = (visRemaining == maxRemaining);
+            tiedLocalIdx = find(tiedMask);
+
+            if numel(tiedLocalIdx) == 1
+                % Clear winner — no tiebreaker needed
+                bestLocalIdx = tiedLocalIdx;
+            else
+                % Multiple satellites have the same remaining window;
+                % break the tie by choosing the highest elevation
+                [~, tieBreaker] = max(elevAll(tiedLocalIdx));
+                bestLocalIdx    = tiedLocalIdx(tieBreaker);
+            end
+
+            currentServingSat = visibleIdx(bestLocalIdx);
+
+            bestSatIndex(tIdx)           = currentServingSat;
+            bestElevation_deg(tIdx)      = round(elevAll(bestLocalIdx), 4);
+            bestRemainingVis_sec(tIdx)   = maxRemaining;
+        end
+    end
+
+    % Print progress every 10 steps to keep the console readable
+    % without flooding it with 361 individual lines.
+    if mod(tIdx, 10) == 0 || tIdx == numTimeSteps
+        elapsedSec = toc(tStart);
+        pct        = 100 * tIdx / numTimeSteps;
+        avgPerStep = elapsedSec / tIdx;
+        remainSec  = avgPerStep * (numTimeSteps - tIdx);
+
+        if isnan(bestSatIndex(tIdx))
+            bestLabel   = "None";
+            remVisLabel = 0;
+        else
+            bestLabel   = tleTable.SatelliteLabel(bestSatIndex(tIdx));
+            remVisLabel = bestRemainingVis_sec(tIdx);
+        end
+
+        fprintf(['Step %3d / %3d | %6.2f%% | Visible: %2d | ' ...
+                 'Scans: %6d | Elapsed: %5.1f s | Remain est.: %5.1f s | ' ...
+                 'Serving: %s | RemVis: %.0f s\n'], ...
+                 tIdx, numTimeSteps, pct, numVisible, ...
+                 cumulativeSatelliteScans, elapsedSec, remainSec, ...
+                 bestLabel, remVisLabel);
+    end
+end
+
+%% ========================================================================
+% 9) BUILD THE SAMPLE-BY-SAMPLE HANDOVER TIMELINE
+% ========================================================================
+% Pull metadata from the TLE table for each time step and assemble the
+% full timeline table. The lookup is vectorized — one read per column
+% across all valid steps — rather than row-by-row in a loop.
+%
+% This table includes a RemainingVisibility_sec column that File-6 does
+% not have. It shows how many seconds of visibility the serving satellite
+% had left at each time step — useful for visualising how the terminal
+% "knows in advance" how long each satellite will serve.
+
+validMask = ~isnan(bestSatIndex);
+
+ActiveSatellite  = repmat("No Satellite", numTimeSteps, 1);
+PlaneNumber      = nan(numTimeSteps, 1);
+SatelliteInPlane = nan(numTimeSteps, 1);
+CatalogNumber    = nan(numTimeSteps, 1);
+IsHandler        = false(numTimeSteps, 1);
+
+if any(validMask)
+    validIdxList = bestSatIndex(validMask);
+
+    ActiveSatellite(validMask)  = tleTable.SatelliteLabel(validIdxList);
+    PlaneNumber(validMask)      = tleTable.PlaneNumber(validIdxList);
+    SatelliteInPlane(validMask) = tleTable.SatelliteInPlane(validIdxList);
+    CatalogNumber(validMask)    = tleTable.CatalogNumber(validIdxList);
+    IsHandler(validMask)        = tleTable.IsHandler(validIdxList);
+end
+
+% Round remaining visibility to the nearest second — sub-second precision
+% is meaningless at a 30-second sample interval
+bestRemainingVis_sec = round(bestRemainingVis_sec);
+
+% HandoverFlag marks every step where the serving satellite changed,
+% making it easy to filter just the handover events in Excel
+HandoverFlag = false(numTimeSteps, 1);
+for tIdx = 2:numTimeSteps
+    if ~isequaln(bestSatIndex(tIdx), bestSatIndex(tIdx-1))
+        HandoverFlag(tIdx) = true;
+    end
+end
+
+handoverTimeline = table( ...
+    timeHistory(:), ...
+    bestSatIndex, ...
+    ActiveSatellite, ...
+    PlaneNumber, ...
+    SatelliteInPlane, ...
+    CatalogNumber, ...
+    IsHandler, ...
+    bestElevation_deg, ...
+    bestRemainingVis_sec, ...
+    numVisibleSats, ...
+    HandoverFlag, ...
+    'VariableNames', { ...
+        'Time', ...
+        'BestSatelliteIndex', ...
+        'ActiveSatellite', ...
+        'PlaneNumber', ...
+        'SatelliteInPlane', ...
+        'CatalogNumber', ...
+        'IsHandler', ...
+        'Elevation_deg', ...
+        'RemainingVisibility_sec', ...
+        'NumVisibleSatellites', ...
+        'HandoverFlag'} );
+
+%% ========================================================================
+% 10) MERGE CONSECUTIVE SELECTIONS INTO SERVING INTERVALS
+% ========================================================================
+% Collapse the per-step timeline into a compact interval table — one row
+% per continuous service window. For each interval we compute duration,
+% elevation statistics, estimated orbit numbers, and the remaining
+% visibility count at the moment the satellite was originally selected.
+%
+% That last column (RemainingVisAtSelection_sec) is unique to this file.
+% It lets you compare how long the algorithm predicted each satellite
+% would serve versus how long it actually served.
+
+maxSegments = numTimeSteps;
+
+seg_HandoverNumber  = zeros(maxSegments, 1);
+seg_ActiveSatellite = strings(maxSegments, 1);
+seg_PlaneNumber     = nan(maxSegments, 1);
+seg_SatInPlane      = nan(maxSegments, 1);
+seg_CatalogNumber   = nan(maxSegments, 1);
+seg_IsHandler       = false(maxSegments, 1);
+seg_StartTime       = NaT(maxSegments, 1, 'TimeZone', 'UTC');
+seg_EndTime         = NaT(maxSegments, 1, 'TimeZone', 'UTC');
+seg_Duration_sec    = zeros(maxSegments, 1);
+seg_StartOrbit      = nan(maxSegments, 1);
+seg_EndOrbit        = nan(maxSegments, 1);
+seg_MaxElevation    = nan(maxSegments, 1);
+seg_MeanElevation   = nan(maxSegments, 1);
+seg_MaxRemVis       = nan(maxSegments, 1);   % remaining visibility at selection moment
+
+segCount    = 0;
+segStart    = 1;
+handoverNum = 0;
+
+for tIdx = 2:(numTimeSteps + 1)
+
+    isBreak = (tIdx > numTimeSteps) || ...
+              ~isequaln(bestSatIndex(tIdx), bestSatIndex(segStart));
+
+    if isBreak
+        handoverNum = handoverNum + 1;
+        segEnd      = tIdx - 1;
+
+        startTimeSeg = timeHistory(segStart);
+        endTimeSeg   = timeHistory(segEnd) + seconds(sampleTime);
+        durationSec  = round(seconds(endTimeSeg - startTimeSeg));
+        selectedIdx  = bestSatIndex(segStart);
+
+        segCount = segCount + 1;
+        seg_HandoverNumber(segCount) = handoverNum;
+        seg_StartTime(segCount)      = startTimeSeg;
+        seg_EndTime(segCount)        = endTimeSeg;
+        seg_Duration_sec(segCount)   = durationSec;
+
+        if isnan(selectedIdx)
+            seg_ActiveSatellite(segCount) = "No Satellite";
+            % Remaining numeric fields stay NaN from pre-allocation
+
+        else
+            seg_ActiveSatellite(segCount) = tleTable.SatelliteLabel(selectedIdx);
+            seg_PlaneNumber(segCount)     = tleTable.PlaneNumber(selectedIdx);
+            seg_SatInPlane(segCount)      = tleTable.SatelliteInPlane(selectedIdx);
+            seg_CatalogNumber(segCount)   = tleTable.CatalogNumber(selectedIdx);
+            seg_IsHandler(segCount)       = tleTable.IsHandler(selectedIdx);
+
+            seg_StartOrbit(segCount) = estimateOrbitNumber(tleEpoch, startTimeSeg, ...
+                tleTable.MeanMotion_rev_per_day(selectedIdx), ...
+                tleTable.RevAtEpoch(selectedIdx));
+            seg_EndOrbit(segCount) = estimateOrbitNumber(tleEpoch, endTimeSeg, ...
+                tleTable.MeanMotion_rev_per_day(selectedIdx), ...
+                tleTable.RevAtEpoch(selectedIdx));
+
+            segElev = bestElevation_deg(segStart:segEnd);
+            seg_MaxElevation(segCount)  = round(max(segElev,  [], 'omitnan'), 4);
+            seg_MeanElevation(segCount) = round(mean(segElev, 'omitnan'),     4);
+
+            % How long did the algorithm predict this satellite would serve
+            % at the moment it was selected?
+            seg_MaxRemVis(segCount) = bestRemainingVis_sec(segStart);
+        end
+
+        segStart = tIdx;
+    end
+end
+
+% Trim pre-allocated arrays to actual count, then build the table once
+handoverTable = table( ...
+    seg_HandoverNumber(1:segCount), ...
+    seg_ActiveSatellite(1:segCount), ...
+    seg_PlaneNumber(1:segCount), ...
+    seg_SatInPlane(1:segCount), ...
+    seg_CatalogNumber(1:segCount), ...
+    seg_IsHandler(1:segCount), ...
+    seg_StartTime(1:segCount), ...
+    seg_EndTime(1:segCount), ...
+    seg_Duration_sec(1:segCount), ...
+    seg_StartOrbit(1:segCount), ...
+    seg_EndOrbit(1:segCount), ...
+    seg_MaxElevation(1:segCount), ...
+    seg_MeanElevation(1:segCount), ...
+    seg_MaxRemVis(1:segCount), ...
+    'VariableNames', { ...
+        'HandoverNumber', ...
+        'ActiveSatellite', ...
+        'PlaneNumber', ...
+        'SatelliteInPlane', ...
+        'CatalogNumber', ...
+        'IsHandler', ...
+        'StartTime', ...
+        'EndTime', ...
+        'Duration_sec', ...
+        'StartOrbit', ...
+        'EndOrbit', ...
+        'MaxElevation_deg', ...
+        'MeanElevation_deg', ...
+        'RemainingVisAtSelection_sec'} );
+
+%% ========================================================================
+% 11) SUMMARY STATISTICS
+% ========================================================================
+
+validRows    = ~strcmp(handoverTable.ActiveSatellite, "No Satellite");
+numHandovers = max(0, sum(validRows) - 1);
+
+totalElapsed = toc(tStart);
+
+fprintf('\n============================================================\n');
+fprintf('LONGEST VISUAL TIME SELECTION COMPLETE\n');
+fprintf('============================================================\n');
+fprintf('Strategy                        : Longest Visual Time\n');
+fprintf('Tiebreaker                      : Highest Elevation\n');
+fprintf('Satellites in constellation     : %d\n', numSats);
+fprintf('Time steps processed            : %d\n', numTimeSteps);
+fprintf('Cumulative satellite scans      : %d\n', cumulativeSatelliteScans);
+fprintf('Merged serving intervals        : %d\n', height(handoverTable));
+fprintf('Actual handovers                : %d\n', numHandovers);
+fprintf('Runtime                         : %.2f seconds\n', totalElapsed);
+fprintf('============================================================\n');
+fprintf('\nFor comparison with File-6 (Highest Elevation strategy):\n');
+fprintf('  File-6 : quality-driven selection with hysteresis guard\n');
+fprintf('  File-7 : window-driven selection, handover only when forced\n');
+fprintf('  A lower handover count here confirms the paper strategy works.\n');
+fprintf('============================================================\n\n');
+
+if ~isempty(handoverTable)
+    disp('First 30 rows of handoverTable:');
+    disp(handoverTable(1:min(30, height(handoverTable)), :));
+end
+
+%% ========================================================================
+% 12) EXPORT RESULTS
+% ========================================================================
+% Two Excel files are produced:
+
+
+excelRaw       = fullfile(saveFolder, 'longest_visual_time_handover.xlsx');
+excelFormatted = fullfile(saveFolder, 'longest_visual_time_handover_formatted.xlsx');
+matOut         = fullfile(saveFolder, 'longest_visual_time_handover.mat');
+
+try
+    writetable(handoverTimeline, excelRaw, 'Sheet', 'HandoverTimeline');
+    writetable(handoverTable,    excelRaw, 'Sheet', 'HandoverTable');
+    fprintf('Raw Excel saved:\n%s\n', excelRaw);
+catch ME
+    warning('Raw Excel export failed: %s', ME.message);
+end
+
+try
+    buildFormattedExcel(handoverTimeline, handoverTable, sampleTime, excelFormatted);
+    fprintf('Formatted Excel saved:\n%s\n', excelFormatted);
+catch ME
+    warning('Formatted Excel failed: %s', ME.message);
+end
+
+save(matOut, 'handoverTimeline', 'handoverTable', 'minElevation', ...
+    'totalElapsed', 'cumulativeSatelliteScans', 'remainingSec');
+fprintf('MAT file saved:\n%s\n', matOut);
+
+%% ========================================================================
+% 13) NOTES FOR REFERENCE
+% ========================================================================
+% Strategy comparison
+%
+%   Highest Elevation Angle
+%     Selects the satellite currently at the highest elevation — best
+%     instantaneous link quality. Without a hysteresis guard it switches
+%     very frequently; with hysteresis (margin = 5 deg, dwell = 10 steps)
+%     it behaves more realistically but is still driven by current quality.
+%
+%   Longest Visual Time  [this file — matches the paper]
+%     Selects the satellite with the most remaining visibility. The terminal
+%     stays connected until that satellite drops below the horizon, so
+%     handovers only happen when they are unavoidable. No hysteresis is
+%     needed because the strategy naturally avoids unnecessary switches.
+%     A tiebreaker (highest elevation) is applied when two satellites have
+%     identical remaining windows.
+%
+%     This matches the strategy in Romero et al. The paper found that the
+%     longest-visual approach outperforms the strongest-signal approach
+%     when handover processing delay exceeds roughly 130 ms.
+%
+% Extra columns in this file's output (not present in File-6):
+%   RemainingVisibility_sec      (HandoverTimeline)
+%     How many seconds of visibility the serving satellite had left at
+%     each time step. Useful for plotting how the terminal tracked the
+%     satellite's approaching end-of-visibility.
+%
+%   RemainingVisAtSelection_sec  (HandoverTable)
+%     How long the algorithm predicted the chosen satellite would serve
+%     at the exact moment it was selected. Comparing this to Duration_sec
+%     shows how accurately the forward-looking strategy worked in practice.
+%
+% ========================================================================
+
+%% ========================================================================
+% LOCAL FUNCTIONS
+% ========================================================================
+
+function orbitNum = estimateOrbitNumber(tleEpoch, t, n_rev_day, revAtEpoch)
+    % Estimate orbit number at time t by linear extrapolation from the
+    % TLE epoch. Accurate enough for a 3-hour analysis window.
+    dt_days  = days(t - tleEpoch);
+    orbitNum = floor(revAtEpoch + n_rev_day .* dt_days);
+end
+
+% -------------------------------------------------------------------------
+
+function buildFormattedExcel(handoverTimeline, handoverTable, sampleTime, outFile)
+% BUILDFORMATTEDEXCEL  Write a styled colour-coded Excel report using the
+% Windows COM interface — no Python or third-party toolbox required.
+%
+% This produces a single sheet with one row per serving interval. The
+% layout matches the File-6 report but adds a "Rem. Vis at Selection"
+% column showing how long each satellite was predicted to serve when it
+% was chosen. Handler satellite rows are highlighted in red; all other
+% rows cycle through an alternating fill palette for easy reading.
+% Header rows are frozen and auto-filter is enabled on all columns.
+%
+% Inputs:
+%   handoverTimeline  — per-sample table from Section 9
+%   handoverTable     — merged intervals table from Section 10
+%   sampleTime        — scenario sample interval in seconds
+%   outFile           — full output path for the .xlsx file
+
+    % Colour constants — Excel COM uses BGR-packed integers
+    % (value = R + G*256 + B*65536)
+    COL_HDR_BG  = rgb2xl(31,  78, 121);   % navy   #1F4E79
+    COL_HDR_FG  = rgb2xl(255,255,255);    % white
+    COL_HANDLER = rgb2xl(192,  0,   0);   % red    #C00000
+    COL_HAND_FG = rgb2xl(255,255,255);    % white
+    COL_BLACK   = rgb2xl(  0,  0,   0);
+
+    % Cycle through these fills for non-handler rows
+    ALT_FILLS = [ ...
+        rgb2xl(255,255,255); ...   % white
+        rgb2xl(220,230,241); ...   % light blue
+        rgb2xl(226,239,218); ...   % light green
+        rgb2xl(255,242,204); ...   % light yellow
+        rgb2xl(252,228,214); ...   % light orange
+        rgb2xl(232,213,240); ...   % light purple
+        rgb2xl(217,234,211)];      % mint green
+
+    % ── Group timeline rows into consecutive same-satellite intervals ──────
+    nRows   = height(handoverTimeline);
+    satIdx  = handoverTimeline.BestSatelliteIndex;
+    timeVec = handoverTimeline.Time;
+    elevVec = handoverTimeline.Elevation_deg;
+    remVec  = handoverTimeline.RemainingVisibility_sec;
+    visVec  = handoverTimeline.NumVisibleSatellites;
+
+    % Lookup key for orbit numbers from the merged interval table
+    orbitLookupKey = strcat(handoverTable.ActiveSatellite, ...
+                            string(handoverTable.StartTime));
+
+    groups = struct( ...
+        'active',{}, 'plane',{}, 'sip',{}, 'catalog',{}, 'handler',{}, ...
+        'startTime',{}, 'endTime',{}, 'durSec',{}, ...
+        'minEl',{}, 'maxEl',{}, 'minVis',{}, 'maxVis',{}, ...
+        'startOrb',{}, 'endOrb',{}, 'remVisAtSel',{});
+
+    i = 1;
+    while i <= nRows
+        j = i;
+        while j <= nRows && isequaln(satIdx(j), satIdx(i))
+            j = j + 1;
+        end
+        segS = i;
+        segE = j - 1;
+
+        g.active    = handoverTimeline.ActiveSatellite(segS);
+        g.plane     = handoverTimeline.PlaneNumber(segS);
+        g.sip       = handoverTimeline.SatelliteInPlane(segS);
+        g.catalog   = handoverTimeline.CatalogNumber(segS);
+        g.handler   = handoverTimeline.IsHandler(segS);
+        g.startTime = timeVec(segS);
+        g.endTime   = timeVec(segE) + seconds(sampleTime);
+        g.durSec    = round(seconds(g.endTime - g.startTime));
+
+        segElevs  = elevVec(segS:segE);
+        segVis    = visVec(segS:segE);
+        g.minEl   = round(min(segElevs, [], 'omitnan'), 4);
+        g.maxEl   = round(max(segElevs, [], 'omitnan'), 4);
+        g.minVis  = min(segVis);
+        g.maxVis  = max(segVis);
+
+        % Remaining visibility at the moment this satellite was selected
+        g.remVisAtSel = remVec(segS);
+
+        % Look up orbit numbers
+        lk = strcat(g.active, string(g.startTime));
+        hi = find(strcmp(orbitLookupKey, lk), 1);
+        if ~isempty(hi)
+            g.startOrb = handoverTable.StartOrbit(hi);
+            g.endOrb   = handoverTable.EndOrbit(hi);
+        else
+            g.startOrb = NaN;
+            g.endOrb   = NaN;
+        end
+
+        groups(end+1) = g; %#ok<AGROW>
+        i = j;
+    end
+
+    nGroups = numel(groups);
+
+    % ── Open Excel via COM ────────────────────────────────────────────────
+    Excel = actxserver('Excel.Application');
+    Excel.Visible       = false;
+    Excel.DisplayAlerts = false;
+
+    % Delete existing file so SaveAs doesn't prompt for overwrite
+    if exist(outFile, 'file'), delete(outFile); end
+
+    WB = Excel.Workbooks.Add();
+    WS = WB.Worksheets.Item(1);
+    WS.Name = 'Handover Summary (LVT)';
+
+    % ── Row 1: title spanning all columns ─────────────────────────────────
+    titleRange = WS.Range('A1:N1');
+    titleRange.Merge();
+    titleRange.Value = ['LONGEST VISUAL TIME HANDOVER TABLE  ' char(8212) ...
+        '  Irving, Texas  |  20-Aug-2025  (3-hour window)'];
+    titleRange.Font.Bold           = true;
+    titleRange.Font.Size           = 12;
+    titleRange.Font.Color          = COL_HDR_FG;
+    titleRange.Interior.Color      = COL_HDR_BG;
+    titleRange.HorizontalAlignment = -4108;
+    titleRange.VerticalAlignment   = -4108;
+    WS.Rows.Item(1).RowHeight      = 28;
+
+    % ── Row 2: column headers ──────────────────────────────────────────────
+    % This report has one extra column vs File-6: Rem. Vis at Selection
+    HEADERS = {'#', 'Active Satellite', 'Plane Number', 'Sat In Plane', ...
+               'Catalog Number', 'Is Handler', 'Start Time', 'End Time', ...
+               'Duration (sec)', 'Elevation Range (deg)', ...
+               'Start Orbit', 'End Orbit', ...
+               'Visible Sats (min-max)', 'Rem. Vis at Selection (sec)'};
+    nCols = numel(HEADERS);
+
+    WS.Rows.Item(2).RowHeight = 36;
+    for c = 1:nCols
+        cl = WS.Cells.Item(2, c);
+        cl.Value               = HEADERS{c};
+        cl.Font.Bold           = true;
+        cl.Font.Size           = 10;
+        cl.Font.Name           = 'Arial';
+        cl.Font.Color          = COL_HDR_FG;
+        cl.Interior.Color      = COL_HDR_BG;
+        cl.HorizontalAlignment = -4108;
+        cl.VerticalAlignment   = -4108;
+        cl.WrapText            = true;
+        setBorder(cl);
+    end
+
+    % ── Data rows ─────────────────────────────────────────────────────────
+    for r = 1:nGroups
+        g      = groups(r);
+        exRow  = r + 2;
+        isHand = logical(g.handler);
+
+        % Handler rows: solid red with white text
+        % All others: cycle through the alternating fill palette
+        if isHand
+            rowBg = COL_HANDLER;
+            rowFg = COL_HAND_FG;
+        else
+            rowBg = ALT_FILLS(mod(r-1, numel(ALT_FILLS)) + 1);
+            rowFg = COL_BLACK;
+        end
+
+        startStr = datestr(g.startTime, 'dd-mmm-yyyy HH:MM:SS');
+        endStr   = datestr(g.endTime,   'dd-mmm-yyyy HH:MM:SS');
+
+        if isnan(g.minEl)
+            elStr = '-';
+        else
+            elStr = sprintf('%.4f - %.4f', g.minEl, g.maxEl);
+        end
+
+        visStr = sprintf('%d - %d', g.minVis, g.maxVis);
+
+        if isnan(g.startOrb)
+            sOrb = '-';
+            eOrb = '-';
+        else
+            sOrb = g.startOrb;
+            eOrb = g.endOrb;
+        end
+
+        if isHand
+            handlerStr = 'YES';
+        else
+            handlerStr = 'No';
+        end
+
+        vals = {r, char(g.active), g.plane, g.sip, g.catalog, ...
+                handlerStr, startStr, endStr, g.durSec, ...
+                elStr, sOrb, eOrb, visStr, g.remVisAtSel};
+
+        WS.Rows.Item(exRow).RowHeight = 18;
+        for c = 1:nCols
+            cl = WS.Cells.Item(exRow, c);
+            cl.Value               = vals{c};
+            cl.Font.Name           = 'Arial';
+            cl.Font.Size           = 10;
+            cl.Font.Color          = rowFg;
+            cl.Interior.Color      = rowBg;
+            cl.VerticalAlignment   = -4108;
+            if c == 2
+                % Satellite name: left-aligned and bold for readability
+                cl.HorizontalAlignment = -4131;
+                cl.Font.Bold = true;
+            else
+                cl.HorizontalAlignment = -4108;
+            end
+            setBorder(cl);
+        end
+    end
+
+    % ── Column widths ──────────────────────────────────────────────────────
+    colW = [5, 30, 10, 10, 13, 9, 22, 22, 11, 26, 12, 11, 17, 22];
+    for c = 1:nCols
+        WS.Columns.Item(c).ColumnWidth = colW(c);
+    end
+
+    % ── Freeze the title and header rows ──────────────────────────────────
+    % Use the workbook window rather than the application window to avoid
+    % COM null-window errors when Excel is running hidden.
+    try
+        WB.Windows.Item(1).SplitRow    = 2;
+        WB.Windows.Item(1).FreezePanes = true;
+    catch
+        % Non-critical — skip if the window handle is unavailable
+    end
+
+    % ── Enable auto-filter on the header row ──────────────────────────────
+    try
+        WS.Cells.Item(2, 1).AutoFilter();
+    catch
+        % Non-critical — skip if unavailable
+    end
+
+    % ── Save and close ─────────────────────────────────────────────────────
+    WB.SaveAs(outFile, 51);   % 51 = xlOpenXMLWorkbook (.xlsx)
+    WB.Close(false);
+    Excel.Quit();
+    Excel.delete();
+
+end   % buildFormattedExcel
+
+% ── Convert R,G,B to the BGR-packed integer that Excel COM expects ─────────
+function v = rgb2xl(r, g, b)
+    v = r + g*256 + b*65536;
+end
+
+% ── Apply a thin grey border to a single cell ─────────────────────────────
+% Each border side is named explicitly rather than passed by index to avoid
+% a "No method Item with matching signature" COM error on some Excel versions.
+function setBorder(cl)
+    bc    = rgb2xl(191, 191, 191);
+    names = {'EdgeLeft','EdgeRight','EdgeTop','EdgeBottom'};
+    for k = 1:4
+        try
+            b = cl.Borders.(names{k});
+            b.LineStyle = 1;    % xlContinuous
+            b.Weight    = 2;    % xlThin
+            b.Color     = bc;
+        catch
+            % Skip this border side if the COM property is unavailable
+        end
+    end
+end
