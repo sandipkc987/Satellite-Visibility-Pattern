@@ -1,0 +1,1 @@
+# Satellite-Visibility-Pattern
