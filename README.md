@@ -149,9 +149,9 @@ handover delay exceeds **130 ms**
 ## Repository Files
 | File | Description |
 |------|-------------|
-| `file1` | Constellation setup, TLE table, scenario workspace |
-| `file6` | Highest elevation handover strategy with hysteresis |
-| `file7` | Longest visual time handover strategy |
+| `starlink_walker_constellation_and_tle_table.m` | Constellation setup, TLE table, scenario workspace |
+| `highest_elevation_handover.m` | Highest elevation handover strategy with hysteresis |
+| `longest_visual_time_handover.m` | Longest visual time handover strategy |
 | `visibility_pattern_notes.mlx` | Full live script with research notes |
 | `visibility_pattern_notes.pdf` | Exported PDF with all figures |
 
@@ -171,6 +171,5 @@ handover delay exceeds **130 ms**
 | Simulation Date | August 20, 2025 |
 ```
 
----
 
 
