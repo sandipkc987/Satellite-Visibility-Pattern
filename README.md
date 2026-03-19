@@ -173,6 +173,4 @@ handover delay exceeds **130 ms**
 
 ---
 
-**Step 4 — Scroll down, click "Commit changes", add message:**
-```
-Add full README with research notes and simulation details
+
