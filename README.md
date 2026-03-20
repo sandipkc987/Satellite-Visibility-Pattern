@@ -120,17 +120,61 @@ satellite. At lower elevation angles the signal travels a longer atmospheric
 path — at 10 degrees elevation the path is approximately **5.76× longer** 
 than at zenith, causing greater attenuation and degraded link quality.
 
-To prevent excessive ping-pong handovers from marginal elevation differences, 
-a **hysteresis constraint** is applied with two simultaneous conditions:
+## Highest Elevation Handover — How It Works
+
+At each 30-second timestep, the algorithm goes through the following steps
+to decide which satellite should be serving Irving:
+
+### Step 1 — Find all visible satellites
+The binary access matrix is checked at the current timestep. Any satellite
+with a value of 1 (visible and above 10-degree minimum elevation) is added
+to the candidate list.
+
+### Step 2 — Compute elevation angles
+The `aer()` function (azimuth-elevation-range) is called once across all
+visible satellites simultaneously to get their current elevation angles.
+The satellite sitting highest above the horizon is identified as the
+best candidate.
+
+### Step 3 — Apply the hysteresis guard
+Before switching, two conditions must both be true at the same time:
 
 | Condition | Value |
 |-----------|-------|
-| Elevation improvement required | > 5 degrees |
-| Minimum dwell time on current satellite | 10 timesteps = 300 seconds |
+| Candidate must beat current satellite's elevation by | > 5 degrees |
+| Current satellite must have been serving for at least | 10 timesteps = 300 seconds |
 
-If either condition is not met, the terminal stays on the current satellite 
-regardless of whether a higher elevation is available. **Forced handovers** 
-occur only when the serving satellite drops below the 10-degree minimum mask.
+If either condition is not met, the terminal **stays on the current
+satellite** even if a higher one is available. This prevents excessive
+ping-pong handovers caused by two satellites crossing the same elevation
+angle every 30 seconds.
+
+### Step 4 — Forced handover (exception)
+If the serving satellite drops **below the 10-degree minimum elevation
+mask**, the hysteresis guard is bypassed completely and the terminal
+immediately switches to the best available satellite regardless of dwell
+time or elevation margin.
+
+### Step 5 — Record the result
+The serving satellite and its elevation are recorded for that timestep.
+Consecutive timesteps with the same satellite are later merged into a
+single interval showing start time, end time, duration, and elevation
+range.
+
+### Why highest elevation?
+At lower elevation angles the signal travels a longer path through the
+atmosphere. At 10-degree elevation the atmospheric path is approximately
+**5.76 times longer** than at zenith, causing greater signal attenuation
+and degraded link quality. Selecting the highest elevation satellite
+minimises this path length at every moment.
+
+### Hysteresis parameters used
+| Parameter | Value |
+|-----------|-------|
+| Elevation improvement threshold | 5.0 degrees |
+| Minimum dwell time | 10 timesteps (300 seconds) |
+| Sample interval | 30 seconds |
+| Minimum elevation mask | 10 degrees |
 
 ### Strategy 2 — Longest Visual Time
 Selects the satellite with the most remaining visibility time above the ground 
