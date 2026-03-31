@@ -114,7 +114,7 @@ The `floor()` function is used because orbit number must be a whole number.
 
 ## Handover Strategies
 
-### Strategy 1 — Highest Elevation Angle 
+### Strategy 1 — Highest Elevation 
 The satellite with the highest elevation angle is selected as the serving 
 satellite. At lower elevation angles the signal travels a longer atmospheric 
 path — at 10 degrees elevation the path is approximately **5.76× longer** 
@@ -176,10 +176,38 @@ minimises this path length at every moment.
 | Sample interval | 30 seconds |
 | Minimum elevation mask | 10 degrees |
 
-### Strategy 2 — Longest Visual Time
-Selects the satellite with the most remaining visibility time above the ground 
-station. The terminal stays connected until the satellite drops below the 
-horizon — **forced handovers only, no voluntary switching.**
+### Strategy 2 — Longest Visibility
+% Selects the satellite with the longest predicted remaining visibility.
+% Rides each satellite for its full pass to minimize handover frequency.
+%
+% How it works:
+%
+% 1) Monitor the serving satellite's elevation against two thresholds:
+%
+%    - Soft margin (18 deg):
+%      When elevation drops below this AND the satellite has been served
+%      for at least 4 steps (120 s), start scanning for a replacement.
+%
+%    - Hard floor (10 deg):
+%      Force immediate handover regardless of dwell time.
+%
+% 2) When a handover triggers:
+%
+%    - Predict the remaining visibility for every visible satellite by
+%      stepping forward in 30-second increments, up to 1 hour ahead.
+%
+%    - Select the satellite with the longest remaining visibility window.
+%
+%    - Tiebreaker: choose the satellite with the highest current elevation.
+%
+% 3) After each handover:
+%
+%    - Suppress the soft-margin check for 4 steps (120 s) to prevent
+%      ping-pong behavior.
+%
+%      Example:
+%      A rising satellite at 12 deg would otherwise immediately re-trigger
+%      the 18 deg soft-margin condition.
 
 - Minimises total handover count by design  
 - Tiebreaker: highest elevation among satellites with equal remaining windows  
